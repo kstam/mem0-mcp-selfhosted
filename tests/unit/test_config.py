@@ -733,3 +733,91 @@ class TestBuildConfig:
         assert config_dict["embedder"]["config"]["ollama_base_url"] == "http://192.168.0.208:11434"
         assert config_dict["graph_store"]["llm"]["provider"] == "ollama"
         assert config_dict["graph_store"]["llm"]["config"]["ollama_base_url"] == "http://192.168.0.208:11434"
+
+    # --- OpenAI embed provider (15.x) ---
+
+    def test_openai_embed_provider_defaults(self):
+        """OpenAI embed provider sets correct model and dims defaults."""
+        env = {"MEM0_EMBED_PROVIDER": "openai"}
+        config_dict, *_ = self._build_with_env(env)
+
+        assert config_dict["embedder"]["provider"] == "openai"
+        assert config_dict["embedder"]["config"]["model"] == "text-embedding-3-small"
+        assert config_dict["embedder"]["config"]["embedding_dims"] == 1536
+        assert config_dict["vector_store"]["config"]["embedding_model_dims"] == 1536
+
+    def test_openai_embed_provider_no_ollama_url(self):
+        """OpenAI embed provider does not include ollama_base_url."""
+        env = {"MEM0_EMBED_PROVIDER": "openai"}
+        config_dict, *_ = self._build_with_env(env)
+        assert "ollama_base_url" not in config_dict["embedder"]["config"]
+
+    def test_openai_embed_base_url(self):
+        """MEM0_EMBED_OPENAI_BASE_URL flows to embedder config."""
+        env = {
+            "MEM0_EMBED_PROVIDER": "openai",
+            "MEM0_EMBED_OPENAI_BASE_URL": "https://gateway.example.com/v1",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["embedder"]["config"]["openai_base_url"] == "https://gateway.example.com/v1"
+
+    def test_openai_embed_base_url_env_fallback(self):
+        """OPENAI_BASE_URL used when MEM0_EMBED_OPENAI_BASE_URL not set."""
+        env = {
+            "MEM0_EMBED_PROVIDER": "openai",
+            "OPENAI_BASE_URL": "https://fallback-gateway.example.com/v1",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["embedder"]["config"]["openai_base_url"] == "https://fallback-gateway.example.com/v1"
+
+    def test_openai_embed_api_key_explicit(self):
+        """MEM0_EMBED_API_KEY takes highest priority for embed API key."""
+        env = {
+            "MEM0_EMBED_PROVIDER": "openai",
+            "MEM0_EMBED_API_KEY": "sk-embed-explicit",
+            "OPENAI_API_KEY": "sk-openai-fallback",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["embedder"]["config"]["api_key"] == "sk-embed-explicit"
+
+    def test_openai_embed_api_key_openai_fallback(self):
+        """OPENAI_API_KEY used when MEM0_EMBED_API_KEY not set."""
+        env = {
+            "MEM0_EMBED_PROVIDER": "openai",
+            "OPENAI_API_KEY": "sk-openai-key",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["embedder"]["config"]["api_key"] == "sk-openai-key"
+
+    def test_openai_embed_api_key_gateway_token_fallback(self):
+        """Gateway token (resolve_token) used as last fallback for embed API key."""
+        env = {"MEM0_EMBED_PROVIDER": "openai"}
+        config_dict, *_ = self._build_with_env(env)
+        # resolve_token returns "sk-test-token" in _build_with_env
+        assert config_dict["embedder"]["config"]["api_key"] == "sk-test-token"
+
+    def test_openai_embed_model_override(self):
+        """MEM0_EMBED_MODEL overrides the openai default."""
+        env = {
+            "MEM0_EMBED_PROVIDER": "openai",
+            "MEM0_EMBED_MODEL": "text-embedding-3-large",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["embedder"]["config"]["model"] == "text-embedding-3-large"
+
+    def test_openai_embed_dims_override(self):
+        """MEM0_EMBED_DIMS overrides the openai default of 1536."""
+        env = {
+            "MEM0_EMBED_PROVIDER": "openai",
+            "MEM0_EMBED_DIMS": "1024",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        assert config_dict["embedder"]["config"]["embedding_dims"] == 1024
+        assert config_dict["vector_store"]["config"]["embedding_model_dims"] == 1024
+
+    def test_ollama_embed_defaults_unchanged(self):
+        """Ollama embed defaults remain bge-m3 / 1024 after adding openai support."""
+        config_dict, *_ = self._build_with_env({})
+        assert config_dict["embedder"]["config"]["model"] == "bge-m3"
+        assert config_dict["embedder"]["config"]["embedding_dims"] == 1024
+        assert config_dict["vector_store"]["config"]["embedding_model_dims"] == 1024

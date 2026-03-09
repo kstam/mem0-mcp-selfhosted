@@ -6,11 +6,15 @@ mem0ai MemoryConfig dict, and returns provider registration info.
 
 from __future__ import annotations
 
+import logging
 import os
+from pathlib import Path
 from typing import Any, TypedDict
 
 from mem0_mcp_selfhosted.auth import resolve_token
 from mem0_mcp_selfhosted.env import bool_env, env, opt_env
+
+logger = logging.getLogger(__name__)
 
 
 class ProviderInfo(TypedDict):
@@ -74,15 +78,25 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
 
     # --- Embedder ---
     embed_provider = env("MEM0_EMBED_PROVIDER", "ollama")
-    embed_model = env("MEM0_EMBED_MODEL", "bge-m3")
-    embed_url = _resolve_ollama_url("MEM0_EMBED_URL")
-    embed_dims = int(env("MEM0_EMBED_DIMS", "1024"))
+    _embed_model_defaults = {"ollama": "bge-m3", "openai": "text-embedding-3-small"}
+    _embed_dims_defaults = {"ollama": 1024, "openai": 1536}
+    embed_model = env("MEM0_EMBED_MODEL", _embed_model_defaults.get(embed_provider, "bge-m3"))
+    embed_dims = int(env("MEM0_EMBED_DIMS", str(_embed_dims_defaults.get(embed_provider, 1024))))
 
     embedder_config: dict[str, Any] = {
         "model": embed_model,
+        "embedding_dims": embed_dims,
     }
     if embed_provider == "ollama":
+        embed_url = _resolve_ollama_url("MEM0_EMBED_URL")
         embedder_config["ollama_base_url"] = embed_url
+    elif embed_provider == "openai":
+        openai_base_url = opt_env("MEM0_EMBED_OPENAI_BASE_URL") or opt_env("OPENAI_BASE_URL")
+        embed_api_key = opt_env("MEM0_EMBED_API_KEY") or opt_env("OPENAI_API_KEY") or token
+        if openai_base_url:
+            embedder_config["openai_base_url"] = openai_base_url
+        if embed_api_key:
+            embedder_config["api_key"] = embed_api_key
 
     # --- Vector Store ---
     qdrant_url = env("MEM0_QDRANT_URL", "http://localhost:6333")
@@ -117,6 +131,17 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
     # --- History ---
     history_db_path = opt_env("MEM0_HISTORY_DB_PATH")
 
+    # --- Custom Prompts ---
+    custom_fact_prompt: str | None = None
+    fact_prompt_file = opt_env("MEM0_CUSTOM_FACT_PROMPT_FILE")
+    if fact_prompt_file:
+        path = Path(fact_prompt_file).expanduser()
+        if path.exists():
+            custom_fact_prompt = path.read_text(encoding="utf-8").strip()
+            logger.info("Loaded custom fact extraction prompt from %s", path)
+        else:
+            logger.warning("MEM0_CUSTOM_FACT_PROMPT_FILE=%s not found, using default", path)
+
     # --- Build config dict ---
     config_dict: dict[str, Any] = {
         "llm": {
@@ -133,6 +158,9 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
         },
         "version": "v1.1",
     }
+
+    if custom_fact_prompt:
+        config_dict["custom_fact_extraction_prompt"] = custom_fact_prompt
 
     if history_db_path:
         config_dict["history_db_path"] = history_db_path
