@@ -86,6 +86,15 @@ def _init_memory() -> Any:
 
     register_providers(providers_info)
 
+    # Register custom embedder if using OpenAI provider (gateway header support)
+    embed_provider = config_dict.get("embedder", {}).get("provider", "ollama")
+    if embed_provider == "openai":
+        from mem0.utils.factory import EmbedderFactory
+
+        EmbedderFactory.provider_to_class["openai"] = (
+            "mem0_mcp_selfhosted.embed_openai.GatewayOpenAIEmbedding"
+        )
+
     # Patch mem0ai's relationship sanitizer before Memory init
     patch_graph_sanitizer()
     patch_gemini_parse_response()
