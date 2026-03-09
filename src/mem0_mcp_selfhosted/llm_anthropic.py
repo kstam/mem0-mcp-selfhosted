@@ -13,10 +13,11 @@ import logging
 import re
 import time
 
-from mem0_mcp_selfhosted.env import env
 from typing import Any
 
 import anthropic
+
+from mem0_mcp_selfhosted.env import env, opt_env, parse_custom_headers
 from mem0.configs.llms.base import BaseLlmConfig
 from mem0.llms.base import LLMBase
 
@@ -79,6 +80,12 @@ MEMORY_UPDATE_SCHEMA = {
 
 # Model prefixes that support structured outputs (output_config).
 _STRUCTURED_OUTPUT_PREFIXES = ("claude-opus-4", "claude-sonnet-4", "claude-haiku-4")
+
+
+
+def _is_bedrock_mode() -> bool:
+    """Return True if the Bedrock gateway should be used."""
+    return bool(opt_env("ANTHROPIC_BEDROCK_BASE_URL") or opt_env("CLAUDE_CODE_USE_BEDROCK"))
 
 
 def extract_json(text: str) -> str:
@@ -165,12 +172,48 @@ class AnthropicOATLLM(LLMBase):
     def _build_client(self, token: str | None) -> None:
         """Build (or rebuild) the Anthropic client from a token.
 
-        Handles OAT vs API key auth, OAT identity headers, base URL config.
+        Three modes, checked in order:
+        1. Gateway mode (ANTHROPIC_CUSTOM_HEADERS set): Corporate gateways that
+           front Bedrock but accept Bearer auth on the Anthropic-format endpoint.
+           Uses ``anthropic.Anthropic`` with ``auth_token`` (sends
+           ``Authorization: Bearer``) + ``base_url`` from ``ANTHROPIC_BASE_URL``
+           + parsed custom headers.
+        2. Bedrock mode (ANTHROPIC_BEDROCK_BASE_URL, no custom headers): Real
+           AWS Bedrock with standard SigV4 auth via ``AnthropicBedrock``.
+        3. Standard Anthropic API: OAT or API key auth.
+
         Updates self._current_token and self.client.
         """
         self._current_token = token
 
-        client_kwargs: dict[str, Any] = {}
+        custom_headers_raw = opt_env("ANTHROPIC_CUSTOM_HEADERS")
+
+        if custom_headers_raw and _is_bedrock_mode():
+            # Gateway mode: corporate proxy fronting Bedrock (e.g. Wise).
+            # Uses the Anthropic-format endpoint with Bearer auth + custom headers.
+            base_url = (
+                self.config.anthropic_base_url
+                or opt_env("ANTHROPIC_BASE_URL")
+            )
+            client_kwargs: dict[str, Any] = {}
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            if token:
+                client_kwargs["auth_token"] = token
+            client_kwargs["default_headers"] = parse_custom_headers(custom_headers_raw)
+            self.client = anthropic.Anthropic(**client_kwargs)
+            return
+
+        if _is_bedrock_mode() and not custom_headers_raw:
+            # Real Bedrock mode: standard AWS SigV4 auth
+            bedrock_url = opt_env("ANTHROPIC_BEDROCK_BASE_URL")
+            self.client = anthropic.AnthropicBedrock(
+                base_url=bedrock_url or None,
+            )
+            return
+
+        # Standard Anthropic API mode
+        client_kwargs = {}
         if self.config.anthropic_base_url:
             client_kwargs["base_url"] = self.config.anthropic_base_url
 
@@ -242,7 +285,10 @@ class AnthropicOATLLM(LLMBase):
 
         Attempts piggyback then self-refresh (skips wait-and-retry for proactive).
         On failure, proceeds silently — the normal 401 retry flow will handle it.
+        Skipped in Bedrock mode (gateway tokens are refreshed externally).
         """
+        if _is_bedrock_mode():
+            return
         if not self._current_token or not is_oat_token(self._current_token):
             return
         if not is_token_expiring_soon(self._expires_at, self._refresh_threshold):
@@ -286,7 +332,17 @@ class AnthropicOATLLM(LLMBase):
         try:
             response = self._call_with_transient_retry(params)
         except anthropic.AuthenticationError as auth_err:
-            if not is_oat_token(self._current_token):
+            if _is_bedrock_mode():
+                # Gateway mode: invalidate cache and re-run the helper script
+                new_token = resolve_token(invalidate_cache=True)
+                if new_token and new_token != self._current_token:
+                    logger.info("[mem0] Gateway token expired, refreshed via helper script")
+                    self._build_client(new_token)
+                    response = self._call_with_transient_retry(params)
+                else:
+                    logger.error("[mem0] Gateway token expired, helper script returned same or no token")
+                    raise auth_err
+            elif not is_oat_token(self._current_token):
                 raise
 
             # Step 1: Piggyback on credentials file

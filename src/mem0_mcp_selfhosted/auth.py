@@ -9,8 +9,11 @@ Fallback order:
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
+import subprocess
 import time
 from pathlib import Path
 
@@ -21,6 +24,7 @@ from mem0_mcp_selfhosted.env import opt_env
 logger = logging.getLogger(__name__)
 
 _CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+_TOKEN_CACHE_DIR = Path.home() / ".cache" / "mem0-mcp"
 
 # Anthropic OAuth endpoint and Claude Code's public client_id.
 _OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
@@ -64,8 +68,124 @@ def _read_credentials_file() -> str | None:
     return token
 
 
-def resolve_token() -> str | None:
+_DEFAULT_API_KEY_HELPER = Path.home() / ".wise-claude-code" / "token.sh"
+
+
+def _jwt_exp(token: str) -> int | None:
+    """Extract the ``exp`` claim (epoch seconds) from a JWT without verification.
+
+    Returns None if the token is not a valid JWT or has no ``exp`` claim.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    # Base64url decode the payload (add padding as needed)
+    payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+    except Exception:
+        return None
+    exp = payload.get("exp")
+    return int(exp) if isinstance(exp, (int, float)) else None
+
+
+def _cache_path(script_path: str) -> Path:
+    """Return the cache file path for a given helper script path."""
+    key = hashlib.sha256(script_path.encode()).hexdigest()[:16]
+    return _TOKEN_CACHE_DIR / f"token-{key}.json"
+
+
+def _read_cached_token(script_path: str) -> str | None:
+    """Return a cached token if it exists and is not expiring within 5 minutes."""
+    try:
+        data = json.loads(_cache_path(script_path).read_text(encoding="utf-8"))
+        token = data.get("token", "")
+        exp = data.get("exp")
+        if not token or not isinstance(exp, (int, float)):
+            return None
+        # Reject if expiring within 300 seconds
+        if int(exp) - int(time.time()) < 300:
+            return None
+        return token
+    except Exception:
+        return None
+
+
+def _invalidate_cached_token(script_path: str) -> None:
+    """Delete the cache file for a given helper script path."""
+    try:
+        _cache_path(script_path).unlink(missing_ok=True)
+    except Exception as exc:
+        logger.debug("Failed to invalidate token cache: %s", exc)
+
+
+def _write_cached_token(script_path: str, token: str) -> None:
+    """Write a token + its JWT exp to the cache file."""
+    exp = _jwt_exp(token)
+    if exp is None:
+        return  # Not a JWT — don't cache
+    try:
+        _TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _cache_path(script_path).write_text(
+            json.dumps({"token": token, "exp": exp}), encoding="utf-8"
+        )
+    except Exception as exc:
+        logger.debug("Failed to write token cache: %s", exc)
+
+
+def _run_api_key_helper(script_path: str) -> str | None:
+    """Run an apiKeyHelper script and return its stdout as the token.
+
+    Caches the JWT to disk and skips the script on subsequent calls while
+    the token remains valid (with a 5-minute buffer before expiry).
+
+    The script is executed via the shell. Its stdout is used as the token.
+    Returns None on any error (missing file, non-zero exit, empty output).
+    """
+    path = Path(script_path).expanduser()
+    if not path.exists():
+        return None
+
+    # Return cached token if still valid
+    cached = _read_cached_token(script_path)
+    if cached:
+        logger.debug("Auth resolved from token cache (script: %s)", script_path)
+        return cached
+
+    try:
+        result = subprocess.run(
+            str(path),
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("apiKeyHelper script failed: %s", exc)
+        return None
+
+    if result.returncode != 0:
+        logger.warning(
+            "apiKeyHelper script exited %d: %s", result.returncode, result.stderr[:200]
+        )
+        return None
+
+    token = result.stdout.strip()
+    if not token:
+        logger.warning("apiKeyHelper script produced empty output")
+        return None
+
+    _write_cached_token(script_path, token)
+    return token
+
+
+def resolve_token(invalidate_cache: bool = False) -> str | None:
     """Resolve an Anthropic auth token using the prioritized fallback chain.
+
+    Args:
+        invalidate_cache: If True, delete any cached helper-script token before
+            resolving, forcing the helper script to run and produce a fresh token.
+            Use this when a 401 indicates the current token has expired.
 
     Returns the resolved token or None if no auth is available.
     """
@@ -85,6 +205,18 @@ def resolve_token() -> str | None:
         )
         return token
 
+    # Priority 2.5: apiKeyHelper script (e.g. Wise gateway JWT)
+    helper_path = opt_env("MEM0_API_KEY_HELPER")
+    if not helper_path and _DEFAULT_API_KEY_HELPER.exists():
+        helper_path = str(_DEFAULT_API_KEY_HELPER)
+    if helper_path:
+        if invalidate_cache:
+            _invalidate_cached_token(helper_path)
+        token = _run_api_key_helper(helper_path)
+        if token:
+            logger.debug("Auth resolved from apiKeyHelper script: %s", helper_path)
+            return token
+
     # Priority 3: Standard API key
     token = opt_env("ANTHROPIC_API_KEY")
     if token:
@@ -95,7 +227,7 @@ def resolve_token() -> str | None:
     # No auth available
     logger.warning(
         "No Anthropic token found. Checked: MEM0_ANTHROPIC_TOKEN env var, "
-        "%s, ANTHROPIC_API_KEY env var. "
+        "%s, apiKeyHelper script, ANTHROPIC_API_KEY env var. "
         "Anthropic LLM features will be disabled.",
         _CREDENTIALS_PATH,
     )

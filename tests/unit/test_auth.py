@@ -15,6 +15,9 @@ from mem0_mcp_selfhosted.auth import (
     _CREDENTIALS_PATH,
     _OAUTH_CLIENT_ID,
     _OAUTH_TOKEN_URL,
+    _jwt_exp,
+    _read_cached_token,
+    _write_cached_token,
     is_oat_token,
     is_token_expiring_soon,
     read_credentials_full,
@@ -39,6 +42,12 @@ class TestIsOatToken:
 
 class TestResolveToken:
     """Test the prioritized fallback chain."""
+
+    @pytest.fixture(autouse=True)
+    def no_helper_script(self):
+        """Patch out the auto-detected helper script so it never runs in these tests."""
+        with patch("mem0_mcp_selfhosted.auth._DEFAULT_API_KEY_HELPER", Path("/nonexistent/token.sh")):
+            yield
 
     def test_priority_1_env_var(self, monkeypatch):
         """MEM0_ANTHROPIC_TOKEN takes highest priority."""
@@ -270,3 +279,103 @@ class TestIsTokenExpiringSoon:
 
         # Same expiry, threshold 1 hour → True
         assert is_token_expiring_soon(expires_at_ms, threshold_seconds=3600) is True
+
+
+# ---------------------------------------------------------------------------
+# Helper: build a minimal JWT with a given exp claim
+# ---------------------------------------------------------------------------
+
+def _make_jwt(exp: int) -> str:
+    """Build a minimal unsigned JWT with the given exp (epoch seconds)."""
+    import base64 as _b64
+    header = _b64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+    payload = _b64.urlsafe_b64encode(
+        json.dumps({"exp": exp}).encode()
+    ).rstrip(b"=").decode()
+    return f"{header}.{payload}.fakesig"
+
+
+# --- Tests for _jwt_exp() ---
+
+
+class TestJwtExp:
+    def test_extracts_exp_from_valid_jwt(self):
+        exp = int(time.time()) + 3600
+        token = _make_jwt(exp)
+        assert _jwt_exp(token) == exp
+
+    def test_returns_none_for_non_jwt(self):
+        assert _jwt_exp("not-a-jwt") is None
+        assert _jwt_exp("sk-ant-api03-xyz") is None
+
+    def test_returns_none_for_jwt_without_exp(self):
+        import base64 as _b64
+        header = _b64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+        payload = _b64.urlsafe_b64encode(b'{"sub":"user"}').rstrip(b"=").decode()
+        token = f"{header}.{payload}.sig"
+        assert _jwt_exp(token) is None
+
+    def test_returns_none_for_malformed_base64(self):
+        assert _jwt_exp("aaa.!!!.bbb") is None
+
+
+# --- Tests for token cache read/write ---
+
+
+class TestTokenCache:
+    def test_write_and_read_valid_token(self, tmp_path):
+        exp = int(time.time()) + 3600
+        token = _make_jwt(exp)
+        script = "/fake/token.sh"
+
+        with patch("mem0_mcp_selfhosted.auth._TOKEN_CACHE_DIR", tmp_path):
+            _write_cached_token(script, token)
+            result = _read_cached_token(script)
+
+        assert result == token
+
+    def test_expired_token_not_returned(self, tmp_path):
+        # Expired 10 minutes ago
+        exp = int(time.time()) - 600
+        token = _make_jwt(exp)
+        script = "/fake/token.sh"
+
+        with patch("mem0_mcp_selfhosted.auth._TOKEN_CACHE_DIR", tmp_path):
+            _write_cached_token(script, token)
+            result = _read_cached_token(script)
+
+        assert result is None
+
+    def test_token_expiring_within_5min_not_returned(self, tmp_path):
+        # Expires in 4 minutes — within the 300s buffer
+        exp = int(time.time()) + 240
+        token = _make_jwt(exp)
+        script = "/fake/token.sh"
+
+        with patch("mem0_mcp_selfhosted.auth._TOKEN_CACHE_DIR", tmp_path):
+            _write_cached_token(script, token)
+            result = _read_cached_token(script)
+
+        assert result is None
+
+    def test_missing_cache_file_returns_none(self, tmp_path):
+        with patch("mem0_mcp_selfhosted.auth._TOKEN_CACHE_DIR", tmp_path):
+            assert _read_cached_token("/fake/token.sh") is None
+
+    def test_non_jwt_not_cached(self, tmp_path):
+        """write_cached_token silently skips non-JWT tokens (no exp to cache)."""
+        script = "/fake/token.sh"
+        with patch("mem0_mcp_selfhosted.auth._TOKEN_CACHE_DIR", tmp_path):
+            _write_cached_token(script, "not-a-jwt")
+            assert _read_cached_token(script) is None
+
+    def test_different_scripts_use_different_caches(self, tmp_path):
+        exp = int(time.time()) + 3600
+        token_a = _make_jwt(exp)
+        token_b = _make_jwt(exp + 1)
+
+        with patch("mem0_mcp_selfhosted.auth._TOKEN_CACHE_DIR", tmp_path):
+            _write_cached_token("/script/a.sh", token_a)
+            _write_cached_token("/script/b.sh", token_b)
+            assert _read_cached_token("/script/a.sh") == token_a
+            assert _read_cached_token("/script/b.sh") == token_b
