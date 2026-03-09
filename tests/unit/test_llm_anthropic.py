@@ -185,6 +185,12 @@ def _make_llm(token=OAT_TOKEN):
 class TestCallApiTokenRefresh:
     """Tests for _call_api auth retry logic."""
 
+    @pytest.fixture(autouse=True)
+    def no_bedrock_mode(self):
+        """Isolate OAT retry tests from ANTHROPIC_CUSTOM_HEADERS in the real env."""
+        with patch("mem0_mcp_selfhosted.llm_anthropic._is_bedrock_mode", return_value=False):
+            yield
+
     def test_retry_succeeds_with_new_token(self):
         """Step 1 piggyback: _call_api retries when resolve_token returns a different token."""
         llm = _make_llm(OAT_TOKEN)
@@ -283,6 +289,12 @@ class TestCallApiTokenRefresh:
 class TestBuildClient:
     """Tests for _build_client client construction."""
 
+    @pytest.fixture(autouse=True)
+    def no_bedrock_mode(self):
+        """Isolate OAT _build_client tests from ANTHROPIC_CUSTOM_HEADERS in the real env."""
+        with patch("mem0_mcp_selfhosted.llm_anthropic._is_bedrock_mode", return_value=False):
+            yield
+
     def test_oat_token_uses_auth_token_and_headers(self):
         """4.7: OAT token → auth_token kwarg + OAT headers."""
         llm = _make_llm(OAT_TOKEN)
@@ -344,6 +356,12 @@ def _make_api_status_error(status_code):
 
 class TestTransientRetry:
     """Tests for _call_with_transient_retry backoff logic."""
+
+    @pytest.fixture(autouse=True)
+    def no_bedrock_mode(self):
+        """Isolate transient-retry tests from ANTHROPIC_CUSTOM_HEADERS in the real env."""
+        with patch("mem0_mcp_selfhosted.llm_anthropic._is_bedrock_mode", return_value=False):
+            yield
 
     def test_retries_on_500_then_succeeds(self):
         """Transient 500 on first attempt, succeeds on retry."""
@@ -490,6 +508,12 @@ REFRESH_TOKEN_NEW = "sk-ant-ort01-test-refresh-new"
 class TestThreeStepAuthRetry:
     """Tests for the piggyback → self-refresh → wait-and-retry strategy."""
 
+    @pytest.fixture(autouse=True)
+    def no_bedrock_mode(self):
+        """Isolate OAT 3-step retry tests from ANTHROPIC_CUSTOM_HEADERS in the real env."""
+        with patch("mem0_mcp_selfhosted.llm_anthropic._is_bedrock_mode", return_value=False):
+            yield
+
     def test_step1_piggyback_success(self):
         """Step 1: credentials file has new token → piggyback success."""
         llm = _make_llm(OAT_TOKEN)
@@ -602,6 +626,12 @@ class TestThreeStepAuthRetry:
 
 class TestProactiveRefresh:
     """Tests for pre-call proactive token refresh."""
+
+    @pytest.fixture(autouse=True)
+    def no_bedrock_mode(self):
+        """Isolate proactive-refresh tests from ANTHROPIC_CUSTOM_HEADERS in the real env."""
+        with patch("mem0_mcp_selfhosted.llm_anthropic._is_bedrock_mode", return_value=False):
+            yield
 
     def test_proactive_refresh_triggered_when_expiring_soon(self):
         """Token expiring soon → proactive refresh attempted before API call."""
