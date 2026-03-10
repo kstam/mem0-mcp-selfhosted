@@ -44,10 +44,9 @@ class TestResolveToken:
     """Test the prioritized fallback chain."""
 
     @pytest.fixture(autouse=True)
-    def no_helper_script(self):
-        """Patch out the auto-detected helper script so it never runs in these tests."""
-        with patch("mem0_mcp_selfhosted.auth._DEFAULT_API_KEY_HELPER", Path("/nonexistent/token.sh")):
-            yield
+    def no_helper_script(self, monkeypatch):
+        """Ensure MEM0_API_KEY_HELPER is unset so the helper branch never runs."""
+        monkeypatch.delenv("MEM0_API_KEY_HELPER", raising=False)
 
     def test_priority_1_env_var(self, monkeypatch):
         """MEM0_ANTHROPIC_TOKEN takes highest priority."""

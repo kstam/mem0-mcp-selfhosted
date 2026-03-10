@@ -68,9 +68,6 @@ def _read_credentials_file() -> str | None:
     return token
 
 
-_DEFAULT_API_KEY_HELPER = Path.home() / ".wise-claude-code" / "token.sh"
-
-
 def _jwt_exp(token: str) -> int | None:
     """Extract the ``exp`` claim (epoch seconds) from a JWT without verification.
 
@@ -205,10 +202,8 @@ def resolve_token(invalidate_cache: bool = False) -> str | None:
         )
         return token
 
-    # Priority 2.5: apiKeyHelper script (e.g. Wise gateway JWT)
+    # Priority 2.5: apiKeyHelper script (e.g. corporate gateway JWT)
     helper_path = opt_env("MEM0_API_KEY_HELPER")
-    if not helper_path and _DEFAULT_API_KEY_HELPER.exists():
-        helper_path = str(_DEFAULT_API_KEY_HELPER)
     if helper_path:
         if invalidate_cache:
             _invalidate_cached_token(helper_path)
