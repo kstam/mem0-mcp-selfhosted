@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import openai
 import pytest
 
 
@@ -153,3 +154,105 @@ class TestGatewayOpenAIEmbedding:
 
                 call_kwargs = mock_cls.call_args[1]
                 assert call_kwargs["api_key"] == "sk-from-env"
+
+
+def _make_openai_auth_error():
+    """Create an openai.AuthenticationError."""
+    return openai.AuthenticationError(
+        message="401 Unauthorized: Token has expired",
+        response=MagicMock(status_code=401, headers={}),
+        body=None,
+    )
+
+
+class TestEmbedder401Recovery:
+    """Tests for embed() 401 auto-refresh."""
+
+    _LEAK_KEYS = ("ANTHROPIC_CUSTOM_HEADERS", "OPENAI_API_KEY", "OPENAI_BASE_URL")
+
+    def _make_embedder(self):
+        """Create embedder with mocked OpenAI client."""
+        from mem0.configs.embeddings.base import BaseEmbedderConfig
+
+        config = BaseEmbedderConfig(
+            api_key="old-token", model="text-embedding-3-small", embedding_dims=1536,
+        )
+        with patch.dict("os.environ", {}, clear=False) as patched_env:
+            for k in self._LEAK_KEYS:
+                patched_env.pop(k, None)
+            with patch("mem0_mcp_selfhosted.embed_openai.OpenAI") as mock_cls:
+                from mem0_mcp_selfhosted.embed_openai import GatewayOpenAIEmbedding
+
+                embedder = GatewayOpenAIEmbedding(config)
+                return embedder, mock_cls
+
+    def test_401_refreshes_token_and_retries(self):
+        """On 401, resolve_token is called and client is rebuilt with new token."""
+        embedder, mock_cls = self._make_embedder()
+
+        mock_client = mock_cls.return_value
+        success_response = MagicMock()
+        success_response.data = [MagicMock(embedding=[0.1, 0.2])]
+        mock_client.embeddings.create.side_effect = [
+            _make_openai_auth_error(),
+            success_response,
+        ]
+
+        with patch(
+            "mem0_mcp_selfhosted.embed_openai.resolve_token", return_value="new-token"
+        ):
+            with patch.object(embedder, "_build_client") as mock_build:
+                result = embedder.embed("test")
+
+        mock_build.assert_called_once_with("new-token")
+        assert result == [0.1, 0.2]
+
+    def test_401_raises_when_no_token(self):
+        """On 401, if resolve_token returns None, the error propagates."""
+        embedder, mock_cls = self._make_embedder()
+
+        mock_client = mock_cls.return_value
+        mock_client.embeddings.create.side_effect = _make_openai_auth_error()
+
+        with patch(
+            "mem0_mcp_selfhosted.embed_openai.resolve_token", return_value=None
+        ):
+            with pytest.raises(openai.AuthenticationError):
+                embedder.embed("test")
+
+    def test_401_invalidates_cache(self):
+        """On 401, resolve_token is called with invalidate_cache=True."""
+        embedder, mock_cls = self._make_embedder()
+
+        mock_client = mock_cls.return_value
+        success_response = MagicMock()
+        success_response.data = [MagicMock(embedding=[0.1])]
+        mock_client.embeddings.create.side_effect = [
+            _make_openai_auth_error(),
+            success_response,
+        ]
+
+        with patch(
+            "mem0_mcp_selfhosted.embed_openai.resolve_token", return_value="new-token"
+        ) as mock_resolve:
+            with patch.object(embedder, "_build_client"):
+                embedder.embed("test")
+
+        mock_resolve.assert_called_once_with(invalidate_cache=True)
+
+    def test_non_auth_error_not_caught(self):
+        """Non-401 errors propagate without retry."""
+        embedder, mock_cls = self._make_embedder()
+
+        mock_client = mock_cls.return_value
+        mock_client.embeddings.create.side_effect = openai.APIConnectionError(
+            request=MagicMock()
+        )
+
+        with patch(
+            "mem0_mcp_selfhosted.embed_openai.resolve_token"
+        ) as mock_resolve:
+            with pytest.raises(openai.APIConnectionError):
+                embedder.embed("test")
+
+        mock_resolve.assert_not_called()
