@@ -624,6 +624,84 @@ class TestThreeStepAuthRetry:
         assert llm.client.messages.create.call_count == 1
 
 
+class TestGateway401Recovery:
+    """Tests for gateway-mode (bedrock) 401 recovery."""
+
+    @pytest.fixture(autouse=True)
+    def bedrock_mode(self):
+        """Force gateway/bedrock mode for all tests in this class."""
+        with patch("mem0_mcp_selfhosted.llm_anthropic._is_bedrock_mode", return_value=True):
+            yield
+
+    def test_gateway_401_refreshes_and_retries(self):
+        """Gateway 401: helper script returns new token → rebuild client and retry."""
+        llm = _make_llm(OAT_TOKEN)
+        success = _make_api_response("ok")
+        llm.client.messages.create = MagicMock(
+            side_effect=[_make_auth_error(), success]
+        )
+
+        with patch(
+            "mem0_mcp_selfhosted.llm_anthropic.resolve_token", return_value=OAT_TOKEN_NEW
+        ):
+            with patch.object(llm, "_build_client") as mock_build:
+                result = llm._call_api({"model": "test"})
+
+        mock_build.assert_called_once_with(OAT_TOKEN_NEW)
+        assert result is success
+
+    def test_gateway_401_rebuilds_even_when_token_unchanged(self):
+        """Gateway 401: rebuild client even if helper returns same token as _current_token.
+
+        This handles the concurrent case where another thread already updated
+        _current_token to the new token before this thread's 401 handler runs.
+        """
+        llm = _make_llm(OAT_TOKEN)
+        success = _make_api_response("ok")
+        llm.client.messages.create = MagicMock(
+            side_effect=[_make_auth_error(), success]
+        )
+
+        # resolve_token returns the SAME token that's already current
+        with patch(
+            "mem0_mcp_selfhosted.llm_anthropic.resolve_token", return_value=OAT_TOKEN
+        ):
+            with patch.object(llm, "_build_client") as mock_build:
+                result = llm._call_api({"model": "test"})
+
+        # Must still rebuild and retry — not raise
+        mock_build.assert_called_once_with(OAT_TOKEN)
+        assert result is success
+
+    def test_gateway_401_raises_when_no_token(self):
+        """Gateway 401: helper script returns None → raise AuthenticationError."""
+        llm = _make_llm(OAT_TOKEN)
+        llm.client.messages.create = MagicMock(side_effect=_make_auth_error())
+
+        with patch(
+            "mem0_mcp_selfhosted.llm_anthropic.resolve_token", return_value=None
+        ):
+            with pytest.raises(anthropic.AuthenticationError):
+                llm._call_api({"model": "test"})
+
+        assert llm.client.messages.create.call_count == 1
+
+    def test_gateway_401_invalidates_cache(self):
+        """Gateway 401: resolve_token is called with invalidate_cache=True."""
+        llm = _make_llm(OAT_TOKEN)
+        llm.client.messages.create = MagicMock(
+            side_effect=[_make_auth_error(), _make_api_response("ok")]
+        )
+
+        with patch(
+            "mem0_mcp_selfhosted.llm_anthropic.resolve_token", return_value=OAT_TOKEN_NEW
+        ) as mock_resolve:
+            with patch.object(llm, "_build_client"):
+                llm._call_api({"model": "test"})
+
+        mock_resolve.assert_called_once_with(invalidate_cache=True)
+
+
 class TestProactiveRefresh:
     """Tests for pre-call proactive token refresh."""
 

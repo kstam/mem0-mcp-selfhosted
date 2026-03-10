@@ -333,41 +333,46 @@ class AnthropicOATLLM(LLMBase):
             response = self._call_with_transient_retry(params)
         except anthropic.AuthenticationError as auth_err:
             if _is_bedrock_mode():
-                # Gateway mode: invalidate cache and re-run the helper script
+                # Gateway mode: invalidate cache and re-run the helper script.
+                # Always rebuild the client if a token is returned — the concurrent
+                # case where another thread already updated _current_token to the
+                # new token is fine: rebuilding with the same valid token is harmless.
                 new_token = resolve_token(invalidate_cache=True)
-                if new_token and new_token != self._current_token:
+                if new_token:
                     logger.info("[mem0] Gateway token expired, refreshed via helper script")
                     self._build_client(new_token)
                     response = self._call_with_transient_retry(params)
+                    # Do not fall through to the OAT refresh steps below
                 else:
-                    logger.error("[mem0] Gateway token expired, helper script returned same or no token")
+                    logger.error("[mem0] Gateway token expired, helper script returned no token")
                     raise auth_err
-            elif not is_oat_token(self._current_token):
-                raise
-
-            # Step 1: Piggyback on credentials file
-            new_token = self._try_piggyback_refresh()
-            if new_token:
-                logger.info("[mem0] OAT token expired, piggybacked on credentials file refresh")
-                self._build_client(new_token)
-                response = self._call_with_transient_retry(params)
             else:
-                # Step 2: Self-refresh via OAuth
-                new_token = self._try_self_refresh()
+                if not is_oat_token(self._current_token):
+                    raise
+
+                # Step 1: Piggyback on credentials file
+                new_token = self._try_piggyback_refresh()
                 if new_token:
-                    logger.info("[mem0] OAT token expired, self-refreshed via OAuth endpoint")
+                    logger.info("[mem0] OAT token expired, piggybacked on credentials file refresh")
                     self._build_client(new_token)
                     response = self._call_with_transient_retry(params)
                 else:
-                    # Step 3: Wait-and-retry
-                    new_token = self._try_wait_and_retry()
+                    # Step 2: Self-refresh via OAuth
+                    new_token = self._try_self_refresh()
                     if new_token:
-                        logger.info("[mem0] OAT token expired, recovered after wait-and-retry")
+                        logger.info("[mem0] OAT token expired, self-refreshed via OAuth endpoint")
                         self._build_client(new_token)
                         response = self._call_with_transient_retry(params)
                     else:
-                        logger.error("[mem0] OAT token expired, all refresh strategies exhausted")
-                        raise auth_err
+                        # Step 3: Wait-and-retry
+                        new_token = self._try_wait_and_retry()
+                        if new_token:
+                            logger.info("[mem0] OAT token expired, recovered after wait-and-retry")
+                            self._build_client(new_token)
+                            response = self._call_with_transient_retry(params)
+                        else:
+                            logger.error("[mem0] OAT token expired, all refresh strategies exhausted")
+                            raise auth_err
 
         if response.stop_reason == "max_tokens":
             logger.warning(
