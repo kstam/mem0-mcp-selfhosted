@@ -378,3 +378,90 @@ class TestTokenCache:
             _write_cached_token("/script/b.sh", token_b)
             assert _read_cached_token("/script/a.sh") == token_a
             assert _read_cached_token("/script/b.sh") == token_b
+
+
+class TestRunApiKeyHelper:
+    """Tests for _run_api_key_helper retry logic."""
+
+    def _make_script(self, tmp_path, *, output="my-token", exit_code=0):
+        """Create a helper script that prints output and exits with given code."""
+        script = tmp_path / "token.sh"
+        script.write_text(f"#!/bin/sh\necho '{output}'\nexit {exit_code}\n")
+        script.chmod(0o755)
+        return str(script)
+
+    def test_success_on_first_attempt(self, tmp_path):
+        from mem0_mcp_selfhosted.auth import _run_api_key_helper
+
+        script = self._make_script(tmp_path, output="fresh-token")
+        with patch("mem0_mcp_selfhosted.auth._read_cached_token", return_value=None):
+            with patch("mem0_mcp_selfhosted.auth._write_cached_token") as mock_cache:
+                result = _run_api_key_helper(script)
+
+        assert result == "fresh-token"
+        mock_cache.assert_called_once_with(script, "fresh-token")
+
+    def test_returns_cached_token_without_running_script(self, tmp_path):
+        from mem0_mcp_selfhosted.auth import _run_api_key_helper
+
+        script = self._make_script(tmp_path)
+        with patch("mem0_mcp_selfhosted.auth._read_cached_token", return_value="cached"):
+            with patch("subprocess.run") as mock_run:
+                result = _run_api_key_helper(script)
+
+        assert result == "cached"
+        mock_run.assert_not_called()
+
+    def test_retries_on_failure_then_succeeds(self, tmp_path):
+        """Script fails twice then succeeds on 3rd attempt."""
+        from mem0_mcp_selfhosted.auth import _run_api_key_helper, _run_helper_once
+
+        script = self._make_script(tmp_path)
+        call_count = {"n": 0}
+        def _side_effect(path):
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                return None  # fail
+            return "recovered-token"
+
+        with patch("mem0_mcp_selfhosted.auth._read_cached_token", return_value=None):
+            with patch("mem0_mcp_selfhosted.auth._run_helper_once", side_effect=_side_effect):
+                with patch("mem0_mcp_selfhosted.auth.time.sleep") as mock_sleep:
+                    with patch("mem0_mcp_selfhosted.auth._write_cached_token"):
+                        result = _run_api_key_helper(script)
+
+        assert result == "recovered-token"
+        assert call_count["n"] == 3
+        assert mock_sleep.call_count == 2  # slept between attempt 1→2 and 2→3
+
+    def test_returns_none_after_all_attempts_exhausted(self, tmp_path):
+        from mem0_mcp_selfhosted.auth import _run_api_key_helper
+
+        script = self._make_script(tmp_path)
+
+        with patch("mem0_mcp_selfhosted.auth._read_cached_token", return_value=None):
+            with patch("mem0_mcp_selfhosted.auth._run_helper_once", return_value=None):
+                with patch("mem0_mcp_selfhosted.auth.time.sleep"):
+                    result = _run_api_key_helper(script)
+
+        assert result is None
+
+    def test_nonexistent_script_returns_none(self):
+        from mem0_mcp_selfhosted.auth import _run_api_key_helper
+
+        result = _run_api_key_helper("/nonexistent/token.sh")
+        assert result is None
+
+    def test_retry_delay_between_attempts(self, tmp_path):
+        """Verify the retry delay value passed to time.sleep."""
+        from mem0_mcp_selfhosted.auth import _HELPER_RETRY_DELAY, _run_api_key_helper
+
+        script = self._make_script(tmp_path)
+
+        with patch("mem0_mcp_selfhosted.auth._read_cached_token", return_value=None):
+            with patch("mem0_mcp_selfhosted.auth._run_helper_once", return_value=None):
+                with patch("mem0_mcp_selfhosted.auth.time.sleep") as mock_sleep:
+                    _run_api_key_helper(script)
+
+        for call in mock_sleep.call_args_list:
+            assert call.args[0] == _HELPER_RETRY_DELAY

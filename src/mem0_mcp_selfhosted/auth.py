@@ -130,14 +130,23 @@ def _write_cached_token(script_path: str, token: str) -> None:
         logger.debug("Failed to write token cache: %s", exc)
 
 
+_HELPER_MAX_ATTEMPTS = 3
+_HELPER_TIMEOUT = 60
+_HELPER_RETRY_DELAY = 10
+
+
 def _run_api_key_helper(script_path: str) -> str | None:
     """Run an apiKeyHelper script and return its stdout as the token.
 
     Caches the JWT to disk and skips the script on subsequent calls while
     the token remains valid (with a 5-minute buffer before expiry).
 
-    The script is executed via the shell. Its stdout is used as the token.
-    Returns None on any error (missing file, non-zero exit, empty output).
+    If the script fails (timeout, non-zero exit, empty output), retries up to
+    ``_HELPER_MAX_ATTEMPTS`` times with ``_HELPER_RETRY_DELAY`` seconds between
+    attempts. This gives time for browser-based auth flows (VPN, SSO) to
+    complete in the background.
+
+    Returns None only if all attempts fail.
     """
     path = Path(script_path).expanduser()
     if not path.exists():
@@ -149,15 +158,40 @@ def _run_api_key_helper(script_path: str) -> str | None:
         logger.debug("Auth resolved from token cache (script: %s)", script_path)
         return cached
 
+    for attempt in range(1, _HELPER_MAX_ATTEMPTS + 1):
+        token = _run_helper_once(path)
+        if token:
+            _write_cached_token(script_path, token)
+            return token
+
+        if attempt < _HELPER_MAX_ATTEMPTS:
+            logger.info(
+                "[mem0] apiKeyHelper attempt %d/%d failed, retrying in %ds "
+                "(waiting for browser auth / VPN)",
+                attempt, _HELPER_MAX_ATTEMPTS, _HELPER_RETRY_DELAY,
+            )
+            time.sleep(_HELPER_RETRY_DELAY)
+
+    logger.error(
+        "[mem0] apiKeyHelper failed after %d attempts", _HELPER_MAX_ATTEMPTS
+    )
+    return None
+
+
+def _run_helper_once(path: Path) -> str | None:
+    """Execute the helper script once, returning the token or None."""
     try:
         result = subprocess.run(
             str(path),
             shell=True,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=_HELPER_TIMEOUT,
         )
-    except (subprocess.TimeoutExpired, OSError) as exc:
+    except subprocess.TimeoutExpired:
+        logger.warning("apiKeyHelper script timed out after %ds", _HELPER_TIMEOUT)
+        return None
+    except OSError as exc:
         logger.warning("apiKeyHelper script failed: %s", exc)
         return None
 
@@ -172,7 +206,6 @@ def _run_api_key_helper(script_path: str) -> str | None:
         logger.warning("apiKeyHelper script produced empty output")
         return None
 
-    _write_cached_token(script_path, token)
     return token
 
 
